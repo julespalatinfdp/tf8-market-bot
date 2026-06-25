@@ -1,0 +1,356 @@
+const {
+  Client, GatewayIntentBits, EmbedBuilder,
+  ButtonBuilder, ButtonStyle, ActionRowBuilder,
+  ModalBuilder, TextInputBuilder, TextInputStyle,
+  PermissionFlagsBits, REST, Routes,
+} = require('discord.js');
+const fs = require('fs');
+
+// ─────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────
+const DB_PATH           = process.env.DB_PATH           || './markets-test-db.json';
+const MARKETS_PATH      = process.env.MARKETS_PATH      || './markets.json';
+const ADMIN_LOG_CHANNEL = process.env.ADMIN_LOG_CHANNEL || '1519611317777076325';
+const TEST_MODE         = process.env.TEST_MODE === 'false' ? false : true;
+const COTE_MIN = 1.05;
+const COTE_MAX = 15.0;
+const RAKE     = 0.85;
+
+// ─────────────────────────────────────────
+// DB HELPERS
+// ─────────────────────────────────────────
+function loadDB() {
+  if (!fs.existsSync(DB_PATH)) return {};
+  try { return JSON.parse(fs.readFileSync(DB_PATH, 'utf8')); } catch { return {}; }
+}
+function saveDB(db) { fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2)); }
+function getBalance(userId) { const db = loadDB(); return db[userId]?.points ?? 0; }
+function deductPoints(userId, amount) {
+  const db = loadDB();
+  if (!db[userId]) db[userId] = { points: 0 };
+  db[userId].points -= amount;
+  saveDB(db);
+}
+function creditPoints(userId, amount) {
+  const db = loadDB();
+  if (!db[userId]) db[userId] = { points: 0 };
+  db[userId].points += amount;
+  saveDB(db);
+}
+
+// ─────────────────────────────────────────
+// MARKETS HELPERS
+// ─────────────────────────────────────────
+function loadMarkets() {
+  if (!fs.existsSync(MARKETS_PATH)) return {};
+  try { return JSON.parse(fs.readFileSync(MARKETS_PATH, 'utf8')); } catch { return {}; }
+}
+function saveMarkets(markets) { fs.writeFileSync(MARKETS_PATH, JSON.stringify(markets, null, 2)); }
+
+// ─────────────────────────────────────────
+// ODDS CALCULATION
+// ─────────────────────────────────────────
+function computeOdds(market) {
+  const totalBettors = Object.values(market.bets).flat().length;
+  return market.choices.map((_, i) => {
+    const betOnThis = (market.bets[i] || []).length;
+    if (totalBettors === 0 || betOnThis === 0) return COTE_MAX;
+    const raw = (totalBettors / betOnThis) * RAKE;
+    return Math.min(COTE_MAX, Math.max(COTE_MIN, Math.round(raw * 100) / 100));
+  });
+}
+
+// ─────────────────────────────────────────
+// PROGRESS BAR
+// ─────────────────────────────────────────
+function buildProgressBar(ratio, length = 12) {
+  const filled = Math.round(ratio * length);
+  return '█'.repeat(filled) + '░'.repeat(length - filled);
+}
+
+// ─────────────────────────────────────────
+// MARKET EMBED
+// ─────────────────────────────────────────
+function buildMarketEmbed(market, odds, closed = false) {
+  const totalBets    = Object.values(market.bets).flat().reduce((s, b) => s + b.amount, 0);
+  const totalBettors = Object.values(market.bets).flat().length;
+  const choiceLines  = market.choices.map((choice, i) => {
+    const bettors = (market.bets[i] || []).length;
+    const amount  = (market.bets[i] || []).reduce((s, b) => s + b.amount, 0);
+    const ratio   = totalBettors > 0 ? bettors / totalBettors : 0;
+    return `**${choice}**\n\`${buildProgressBar(ratio)}\` ${Math.round(ratio * 100)}% — odds **x${odds[i]}**\n📊 ${bettors} bettors · ${amount} pts wagered`;
+  });
+  const closeDate = new Date(market.closeAt);
+  const embed = new EmbedBuilder()
+    .setTitle(closed ? `🔴 ${market.title} — CLOSED` : `📈 ${market.title}`)
+    .setDescription(choiceLines.join('\n\n'))
+    .setColor(closed ? '#e74c3c' : '#2ecc71')
+    .addFields(
+      { name: '📦 Total wagered', value: `${totalBets} pts by ${totalBettors} bettors`, inline: true },
+      { name: '⏰ Closes', value: `<t:${Math.floor(closeDate.getTime() / 1000)}:R>`, inline: true }
+    );
+  if (market.image) embed.setImage(market.image);
+  return embed;
+}
+
+// ─────────────────────────────────────────
+// MARKET BUTTONS
+// ─────────────────────────────────────────
+function buildMarketButtons(marketId, market, odds, disabled = false) {
+  const row = new ActionRowBuilder();
+  market.choices.forEach((choice, i) => {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`bet:${marketId}:${i}`)
+        .setLabel(`${choice} x${odds[i]}`)
+        .setStyle(disabled ? ButtonStyle.Secondary : ButtonStyle.Primary)
+        .setDisabled(disabled)
+    );
+  });
+  return row;
+}
+
+// ─────────────────────────────────────────
+// REFRESH EMBED
+// ─────────────────────────────────────────
+async function refreshMarketMessage(client, marketId) {
+  const markets = loadMarkets();
+  const market  = markets[marketId];
+  if (!market || !market.messageId || !market.channelId) return;
+  try {
+    const channel = await client.channels.fetch(market.channelId);
+    const message = await channel.messages.fetch(market.messageId);
+    const odds    = computeOdds(market);
+    const closed  = market.closed || Date.now() >= new Date(market.closeAt).getTime();
+    await message.edit({
+      embeds: [buildMarketEmbed(market, odds, closed)],
+      components: [buildMarketButtons(marketId, market, odds, closed)],
+    });
+  } catch (err) { console.error('❌ Error refreshing embed:', err.message); }
+}
+
+// ─────────────────────────────────────────
+// AUTO CLOSE
+// ─────────────────────────────────────────
+function scheduleAutoClose(client, marketId) {
+  const markets = loadMarkets();
+  const market  = markets[marketId];
+  if (!market) return;
+  const delay = new Date(market.closeAt).getTime() - Date.now();
+  if (delay <= 0) return;
+  setTimeout(async () => {
+    const mkts = loadMarkets();
+    if (!mkts[marketId] || mkts[marketId].closed) return;
+    mkts[marketId].closed = true;
+    saveMarkets(mkts);
+    await refreshMarketMessage(client, marketId);
+    console.log(`🔴 Market ${marketId} auto-closed.`);
+  }, delay);
+}
+
+// ─────────────────────────────────────────
+// CLIENT
+// ─────────────────────────────────────────
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
+
+client.on('interactionCreate', async interaction => {
+
+  // ── SLASH COMMANDS ───────────────────────
+  if (interaction.isChatInputCommand()) {
+
+    // /give-points
+    if (interaction.commandName === 'give-points') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator))
+        return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
+      const target = interaction.options.getUser('user');
+      const amount = interaction.options.getInteger('amount');
+      creditPoints(target.id, amount);
+      return interaction.reply({
+        embeds: [new EmbedBuilder()
+          .setDescription(`✅ **${amount} pts** credited to <@${target.id}>. New balance: **${getBalance(target.id)} pts**`)
+          .setColor('#3498db')],
+        ephemeral: true,
+      });
+    }
+
+    // /create-market
+    if (interaction.commandName === 'create-market') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator))
+        return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
+      const title     = interaction.options.getString('title');
+      const closeAt   = interaction.options.getString('close_at');
+      const c1        = interaction.options.getString('choice1');
+      const c2        = interaction.options.getString('choice2');
+      const c3        = interaction.options.getString('choice3');
+      const image     = interaction.options.getString('image') || null;
+      const channel   = interaction.options.getChannel('channel') || interaction.channel;
+      const closeDate = new Date(closeAt);
+      if (isNaN(closeDate.getTime()) || closeDate <= new Date())
+        return interaction.reply({ content: '❌ Invalid date. Format: `2026-06-24T21:00:00`', ephemeral: true });
+      const marketId = `mkt_${Date.now()}`;
+      const market = {
+        id: marketId, title, choices: [c1, c2, c3],
+        closeAt: closeDate.toISOString(), closed: false, image,
+        channelId: channel.id, messageId: null,
+        bets: { 0: [], 1: [], 2: [] },
+      };
+      const odds = computeOdds(market);
+      const msg  = await channel.send({ embeds: [buildMarketEmbed(market, odds)], components: [buildMarketButtons(marketId, market, odds)] });
+      market.messageId = msg.id;
+      const markets = loadMarkets();
+      markets[marketId] = market;
+      saveMarkets(markets);
+      scheduleAutoClose(client, marketId);
+      if (ADMIN_LOG_CHANNEL) {
+        try {
+          const logCh = await client.channels.fetch(ADMIN_LOG_CHANNEL);
+          await logCh.send({ embeds: [new EmbedBuilder()
+            .setTitle('📋 New market created')
+            .setDescription(`**Title:** ${title}\n**ID:** \`${marketId}\`\n**Closes:** <t:${Math.floor(closeDate.getTime()/1000)}:F>\n**Channel:** <#${channel.id}>`)
+            .setColor('#3498db')] });
+        } catch {}
+      }
+      return interaction.reply({ content: `✅ Market created! ID: \`${marketId}\``, ephemeral: true });
+    }
+
+    // /set-market-result
+    if (interaction.commandName === 'set-market-result') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator))
+        return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
+      const marketId    = interaction.options.getString('market_id');
+      const winnerIndex = interaction.options.getInteger('winner') - 1;
+      const markets = loadMarkets();
+      const market  = markets[marketId];
+      if (!market) return interaction.reply({ content: `❌ Market \`${marketId}\` not found.`, ephemeral: true });
+      if (market.result !== undefined) return interaction.reply({ content: '❌ This market already has a result.', ephemeral: true });
+      const odds      = computeOdds(market);
+      const winnerOdd = odds[winnerIndex];
+      const winners   = market.bets[winnerIndex] || [];
+      let totalCredited = 0;
+      for (const bet of winners) {
+        const gain = Math.floor(bet.amount * winnerOdd);
+        creditPoints(bet.userId, gain);
+        totalCredited += gain;
+      }
+      market.result = winnerIndex;
+      market.closed = true;
+      saveMarkets(markets);
+      await refreshMarketMessage(client, marketId);
+      try {
+        const ch = await client.channels.fetch(market.channelId);
+        await ch.send({ embeds: [new EmbedBuilder()
+          .setTitle('🏆 Market Result')
+          .setDescription(`**${market.title}**\n\n✅ Winning choice: **${market.choices[winnerIndex]}** (x${winnerOdd})\n\n${winners.length} winner(s) — **${totalCredited} pts** credited.`)
+          .setColor('#f1c40f')] });
+      } catch {}
+      return interaction.reply({ content: `✅ Result set. ${winners.length} winner(s) credited.`, ephemeral: true });
+    }
+
+    // /close-market
+    if (interaction.commandName === 'close-market') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator))
+        return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
+      const marketId = interaction.options.getString('market_id');
+      const markets  = loadMarkets();
+      if (!markets[marketId]) return interaction.reply({ content: `❌ Market \`${marketId}\` not found.`, ephemeral: true });
+      markets[marketId].closed = true;
+      saveMarkets(markets);
+      await refreshMarketMessage(client, marketId);
+      return interaction.reply({ content: `✅ Market \`${marketId}\` manually closed.`, ephemeral: true });
+    }
+  }
+
+  // ── BUTTON ───────────────────────────────
+  if (interaction.isButton()) {
+    const parts = interaction.customId.split(':');
+    if (parts[0] !== 'bet') return;
+    const [, marketId, choiceIdxStr] = parts;
+    const choiceIdx = parseInt(choiceIdxStr);
+    const markets = loadMarkets();
+    const market  = markets[marketId];
+    if (!market) return interaction.reply({ content: '❌ Market not found.', ephemeral: true });
+    if (market.closed || Date.now() >= new Date(market.closeAt).getTime())
+      return interaction.reply({ content: '🔴 This market is closed.', ephemeral: true });
+    const alreadyBet = Object.values(market.bets).flat().find(b => b.userId === interaction.user.id);
+    if (!TEST_MODE && alreadyBet)
+      return interaction.reply({ content: '❌ You already placed a bet on this market. Bets are final.', ephemeral: true });
+    const balance = getBalance(interaction.user.id);
+    if (balance < 1)
+      return interaction.reply({ content: "❌ You don't have enough points to bet.", ephemeral: true });
+    const odds       = computeOdds(market);
+    const currentOdd = odds[choiceIdx];
+    const choice     = market.choices[choiceIdx];
+    const modal = new ModalBuilder()
+      .setCustomId(`bet_modal:${marketId}:${choiceIdx}`)
+      .setTitle(`Bet on "${choice}"`);
+    const input = new TextInputBuilder()
+      .setCustomId('amount')
+      .setLabel(`Odds: x${currentOdd} | Balance: ${balance} pts`)
+      .setPlaceholder(`Between 1 and ${balance}`)
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true).setMinLength(1).setMaxLength(6);
+    modal.addComponents(new ActionRowBuilder().addComponents(input));
+    return interaction.showModal(modal);
+  }
+
+  // ── MODAL SUBMIT ─────────────────────────
+  if (interaction.isModalSubmit()) {
+    const parts = interaction.customId.split(':');
+    if (parts[0] !== 'bet_modal') return;
+    const [, marketId, choiceIdxStr] = parts;
+    const choiceIdx = parseInt(choiceIdxStr);
+    const markets = loadMarkets();
+    const market  = markets[marketId];
+    if (!market) return interaction.reply({ content: '❌ Market not found.', ephemeral: true });
+    if (market.closed || Date.now() >= new Date(market.closeAt).getTime())
+      return interaction.reply({ content: '🔴 This market closed between your click and now.', ephemeral: true });
+    const amount  = parseInt(interaction.fields.getTextInputValue('amount'));
+    const balance = getBalance(interaction.user.id);
+    if (isNaN(amount) || amount < 1)
+      return interaction.reply({ content: '❌ Invalid amount. Minimum: 1 pt.', ephemeral: true });
+    if (amount > balance)
+      return interaction.reply({ content: `❌ Insufficient balance. You have **${balance} pts**.`, ephemeral: true });
+    const alreadyBet = Object.values(market.bets).flat().find(b => b.userId === interaction.user.id);
+    if (!TEST_MODE && alreadyBet)
+      return interaction.reply({ content: '❌ You already placed a bet on this market.', ephemeral: true });
+    const odds          = computeOdds(market);
+    const lockedOdd     = odds[choiceIdx];
+    const choice        = market.choices[choiceIdx];
+    const potentialGain = Math.floor(amount * lockedOdd);
+    deductPoints(interaction.user.id, amount);
+    markets[marketId].bets[choiceIdx].push({ userId: interaction.user.id, amount, odd: lockedOdd });
+    saveMarkets(markets);
+    await refreshMarketMessage(client, marketId);
+    return interaction.reply({
+      embeds: [new EmbedBuilder()
+        .setTitle('✅ Bet placed!')
+        .setDescription(
+          `**Choice:** ${choice}\n` +
+          `**Amount:** ${amount} pts\n` +
+          `**Odds:** x${lockedOdd}\n` +
+          `**Potential win:** ${potentialGain} pts\n\n` +
+          `*Bets are final and cannot be cancelled.*`
+        )
+        .setColor('#2ecc71')],
+      ephemeral: true,
+    });
+  }
+});
+
+// ─────────────────────────────────────────
+// READY
+// ─────────────────────────────────────────
+client.once('ready', () => {
+  console.log(`🤖 Bot connected: ${client.user.tag}`);
+  console.log(`🧪 TEST_MODE: ${TEST_MODE ? 'enabled (multiple bets allowed)' : 'disabled (1 bet per market)'}`);
+  const markets = loadMarkets();
+  for (const [id, market] of Object.entries(markets)) {
+    if (!market.closed && new Date(market.closeAt) > new Date()) {
+      scheduleAutoClose(client, id);
+      console.log(`⏰ Auto-close rescheduled: ${id}`);
+    }
+  }
+});
+
+client.login(process.env.DISCORD_TOKEN);
